@@ -23,10 +23,14 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 SESSION_TIMEOUT = 300  # 5 minutes - force session refresh
 HISTORICAL_IMPORT_DAYS = 90 # number of days for initial import
+# Usage Explorer limits the Interval (hourly) view to 30 days.
+WATER_HOURLY_REQUEST_DAYS = 30
 
 # Sensor constants
 ENERGY_SENSOR_KEY = "current_energy_usage"
+WATER_SENSOR_KEY = "current_water_usage"
 ATTR_LAST_READING_TIME = "last_reading_time"
+ATTR_WATER_LAST_READING_TIME = "water_last_reading_time"
 ATTR_ACCOUNT_ID = "account_id"
 ATTR_LOCATION_ID = "location_id"
 LOCATION_KEY = "location"
@@ -34,5 +38,11 @@ METER_NAME   = "meter_name"
 
 # List of supported services provided by the smarthub endpoint
 ELECTRIC_SERVICE = "electric"
-SUPPORTED_SERVICES = [ELECTRIC_SERVICE]
+WATER_SERVICE = "water"
+ELECTRIC_INDUSTRY = "ELECTRIC"
+WATER_INDUSTRY = "WATER"
+SUPPORTED_SERVICES = [ELECTRIC_SERVICE, WATER_SERVICE]
 FALLBACK_SERVICES = ["ELEC", "1ELEC", "VELEC", "GELEC"]
+
+# Observed ECU water source unit. Statistics are stored in cubic feet, not converted.
+WATER_UNIT_CUBIC_FEET = "FT3"

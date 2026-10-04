@@ -18,7 +18,8 @@ from .const import (
     RETRY_DELAY,
     SESSION_TIMEOUT,
     ELECTRIC_SERVICE,
-    SUPPORTED_SERVICES,
+    ELECTRIC_INDUSTRY,
+    WATER_INDUSTRY,
     FALLBACK_SERVICES,
     METER_NAME,
 )
@@ -85,12 +86,14 @@ class SmartHubLocation():
         service: str,
         description: str,
         provider: str,
+        has_water: bool = False,
     )  -> None:
         """Initialize the SmartHubLocation."""
         self.id = id
         self.service = service
         self.description = description
         self.provider = provider
+        self.has_water = has_water
 
     def __str__(self):
         return f"[SmartHubLocation: '{self.id}' '{self.service}' '{self.description}']"
@@ -123,7 +126,7 @@ class SmartHubAPI:
 
     def parse_usage_series(self, usage_data: List[Dict], parseType: ParseType = ParseType.FORWARD) -> List[Dict]:
         parsed_data = []
-        _LOGGER.debug(f"First 10 entries of usage data: {usage_data[:10]}")
+        _LOGGER.debug("Parsing %d usage points", len(usage_data))
         for usage in usage_data:
             # convert microseconds to timestmap -> read data as if it was in provider TZ
             event_time = parse_epoch_set_timezone(usage.get("x") / 1000.0, ZoneInfo(self.timezone))
@@ -197,19 +200,18 @@ class SmartHubAPI:
             electric_data = data.get("data", {}).get("ELECTRIC", [])
             if len(electric_data) == 0:
               _LOGGER.warning("No ELECTRIC data found in response")
-              _LOGGER.debug(data)
 
             for entry in electric_data:
                 # Find the entry with type "USAGE"
                 if entry.get("type","") == "USAGE":
-                    _LOGGER.debug("Usage: %s", entry)
+                    _LOGGER.debug("Parsing ELECTRIC usage entry")
 
                     meters = entry.get("meters", [])
                     forward_series = ""
                     net_series = ""
                     return_series = ""
                     if len(meters) > 2:
-                      _LOGGER.warning("More then 2 meters in usage data: %s", meters)
+                      _LOGGER.warning("More than 2 meters in usage data: %d", len(meters))
                     for meter in meters:
                       # assume forward is default if not present
                       flow_direction = meter.get("flowDirection", ParseType.FORWARD)
@@ -221,7 +223,7 @@ class SmartHubAPI:
                         case ParseType.RETURN:
                           return_series = meter["seriesId"]
                         case _:
-                          _LOGGER.warning("Unknown flow direction in meter: %s", meter)
+                          _LOGGER.warning("Unknown flow direction in meter")
 
                     series = entry.get("series", [])
                     for serie in series:
@@ -244,13 +246,116 @@ class SmartHubAPI:
                               parsed_response["USAGE_RETURN"] = self.parse_usage_series(usage_data, ParseType.NET)
                               _LOGGER.debug("Parsed %d items for USAGE_RETURN history", len(parsed_response["USAGE_RETURN"]))
                 else:
-                    _LOGGER.debug("Unknown Usage: %s", entry)
+                    _LOGGER.debug("Skipping usage entry type %s", entry.get("type"))
 
             return parsed_response
 
         except Exception as e:
-            _LOGGER.error("Error parsing usage data: %s", data)
+            _LOGGER.error("Error parsing usage data")
             raise SmartHubDataError(f"Error parsing usage data: {e}") from e
+
+    def parse_water(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse WATER usage into the same USAGE list shape as electricity.
+
+        ``meterToChartData`` is a second copy of the chart and is ignored.
+        A single series with no id is the one-meter case. Several series without
+        ids are skipped instead of choosing the first one.
+        """
+        try:
+            if not isinstance(data, dict):
+                raise SmartHubDataError("Invalid data format: expected dictionary")
+
+            parsed_response: Dict[str, Any] = {}
+            water_data = data.get("data", {}).get(WATER_INDUSTRY, [])
+            if not water_data:
+                _LOGGER.warning("No WATER data found in response")
+                return parsed_response
+
+            for entry in water_data:
+                if not isinstance(entry, dict) or entry.get("type", "") != "USAGE":
+                    continue
+                selected = self._select_water_series(entry)
+                if selected is None:
+                    _LOGGER.warning("Skipping WATER usage with no identifiable series")
+                    continue
+                parsed_response[METER_NAME] = selected.get("name") or selected.get("meterNumber")
+                parsed_response["USAGE"] = self._parse_water_points(selected.get("data") or [])
+                _LOGGER.debug("Parsed %d WATER usage points", len(parsed_response["USAGE"]))
+            return parsed_response
+        except SmartHubDataError:
+            raise
+        except Exception as e:
+            _LOGGER.error("Error parsing water usage data")
+            raise SmartHubDataError(f"Error parsing water usage data: {e}") from e
+
+    def _select_water_series(self, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Choose the usage series that belongs to the meter. Ignore chart copies."""
+        series = [serie for serie in (entry.get("series") or []) if isinstance(serie, dict)]
+        meters = [meter for meter in (entry.get("meters") or []) if isinstance(meter, dict)]
+        if len(series) == 1 and not meters and not series[0].get("name") and not series[0].get("meterNumber"):
+            return series[0]
+
+        matched = []
+        for serie in series:
+            if any(self._water_series_matches_meter(serie, meter) for meter in meters):
+                matched.append(serie)
+            elif not meters and (serie.get("name") or serie.get("meterNumber")) and len(series) == 1:
+                matched.append(serie)
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            _LOGGER.warning("Multiple WATER series matched meters; not choosing one")
+        elif len(series) > 1:
+            _LOGGER.warning("Multiple WATER series have no meter id")
+        return None
+
+    def _water_series_matches_meter(self, serie: Dict[str, Any], meter: Dict[str, Any]) -> bool:
+        """Match series name or meter number to the meter's seriesId or meterNumber."""
+        name = str(serie.get("name") or "")
+        serie_meter = str(serie.get("meterNumber") or "")
+        series_id = str(meter.get("seriesId") or "")
+        meter_number = str(meter.get("meterNumber") or "")
+        pairs = (
+            (name, series_id),
+            (name, meter_number),
+            (serie_meter, meter_number),
+            (serie_meter, series_id),
+        )
+        return any(left and right and left == right for left, right in pairs)
+
+    def _parse_water_points(self, usage_data: List[Dict]) -> List[Dict]:
+        """Convert source buckets into reading_time, consumption, and raw_timestamp.
+
+        Points use the same timezone stamp as electricity. A point that is not on
+        an hour boundary is omitted so it is not imported as a statistic.
+        """
+        parsed_data = []
+        zone = ZoneInfo(self.timezone)
+        for usage in usage_data:
+            if not isinstance(usage, dict) or "x" not in usage or "y" not in usage:
+                continue
+            if usage.get("x") is None or usage.get("y") is None:
+                continue
+            try:
+                x_ms = int(usage.get("x"))
+                consumption = float(usage.get("y"))
+            except (TypeError, ValueError):
+                continue
+            event_time = parse_epoch_set_timezone(x_ms / 1000.0, zone)
+            if (
+                event_time.tzinfo is None
+                or event_time.minute != 0
+                or event_time.second != 0
+                or event_time.microsecond != 0
+            ):
+                _LOGGER.warning("Skipping water point that is not at the top of an hour")
+                continue
+            parsed_data.append({
+                "reading_time": event_time,
+                "consumption": consumption,
+                "raw_timestamp": x_ms,
+            })
+        return parsed_data
 
     def parse_locations(self, location_json) -> List[SmartHubLocation]:
         # Response format is structured as a list of dictionaries -
@@ -295,7 +400,10 @@ class SmartHubAPI:
           #  "services"
 
         locations = []
-        _LOGGER.debug(location_json)
+        _LOGGER.debug(
+            "Parsing %d location entries",
+            len(location_json) if isinstance(location_json, list) else 0,
+        )
 
         for entry in location_json:
           if entry.get("inactive", False): # assume active by default
@@ -318,6 +426,10 @@ class SmartHubAPI:
           for fallback in FALLBACK_SERVICES:
             if fallback in services:
               electric_service_keys.add(fallback)
+          for service in services:
+            segments = [part.strip() for part in str(service).split("|") if part.strip()]
+            if any(part in FALLBACK_SERVICES for part in segments):
+              electric_service_keys.add(service)
 
           for electric_service in electric_service_keys:
               electrical_providers = serviceToProviders.get(electric_service,["unknown"])
@@ -329,16 +441,29 @@ class SmartHubAPI:
                     # Try to find a good description
                     description = serviceDescription.get("description", "")
 
+                    service_keys = list(serviceDescription.get("services") or [])
                     locations.append(
                       SmartHubLocation(
                         id=locationID,
                         service=ELECTRIC_SERVICE,
                         description=description,
                         provider=providerOrServiceDescription.get(electrical_provider,electrical_provider),
+                        has_water=self._location_has_water(entry, locationID, service_keys),
                       )
                     )
 
         return locations
+
+    def _location_has_water(self, entry: Dict[str, Any], location_id: str, service_keys: List[str]) -> bool:
+        """True when this already-discovered electric location also has water."""
+        industries = entry.get("serviceLocationToIndustries", {}).get(location_id, [])
+        if any(str(industry).upper() == WATER_INDUSTRY for industry in industries):
+            return True
+        for key in list(service_keys) + list(entry.get("services") or []):
+            segments = [part.strip().upper() for part in str(key).split("|") if part.strip()]
+            if WATER_INDUSTRY in segments:
+                return True
+        return False
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp session."""
@@ -499,12 +624,56 @@ class SmartHubAPI:
         except ClientError as e:
             raise SmartHubConnectionError(f"Connection error during User_data request: {e}") from e
 
-    async def get_energy_data(self, location, aggregation:Aggregation, start_datetime=None) -> Optional[Dict[str, Any]]:
+    async def get_energy_data(
+        self,
+        location,
+        aggregation: Aggregation,
+        start_datetime=None,
+        end_datetime=None,
+        industries: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve electricity usage. The default request body stays industries ELECTRIC."""
+        if industries is None:
+            industries = [ELECTRIC_INDUSTRY]
+        response_json = await self._poll_usage(
+            location, aggregation, start_datetime, end_datetime, industries
+        )
+        if response_json is None:
+            return None
+        return self.parse_usage(response_json)
+
+    async def get_water_data(
+        self,
+        location,
+        aggregation: Aggregation,
+        start_datetime=None,
+        end_datetime=None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve water usage. The request body stays industries WATER."""
+        response_json = await self._poll_usage(
+            location,
+            aggregation,
+            start_datetime,
+            end_datetime,
+            [WATER_INDUSTRY],
+        )
+        if response_json is None:
+            return None
+        return self.parse_water(response_json)
+
+    async def _poll_usage(
+        self,
+        location,
+        aggregation: Aggregation,
+        start_datetime,
+        end_datetime,
+        industries: List[str],
+    ) -> Optional[Dict[str, Any]]:
         """
-        Retrieve energy usage data asynchronously with retry logic.
+        Retrieve a utility-usage poll response with retry logic.
 
         Returns:
-            Parsed energy usage data or None if no data available.
+            The COMPLETE response JSON, or None if no data is available.
 
         Raises:
             SmartHubAPIError: If the request fails after retries.
@@ -514,7 +683,8 @@ class SmartHubAPI:
         # Calculate startDateTime and endDateTime
         now = datetime.now()
         # Get data since specified start (or last 30 days) as of midnight yesterday
-        end_datetime = now.replace(minute=0, second=0, microsecond=0)
+        if end_datetime is None:
+            end_datetime = now.replace(minute=0, second=0, microsecond=0)
         if start_datetime is None:
           # fetch data from last period
           start_datetime = end_datetime - timedelta(days=30)
@@ -529,7 +699,7 @@ class SmartHubAPI:
             "includeDemand": False,
             "serviceLocationNumber": location.id,
             "accountNumber": self.account_id,
-            "industries": ["ELECTRIC"],
+            "industries": industries,
             "startDateTime": str(start_timestamp),
             "endDateTime": str(end_timestamp),
         }
@@ -569,10 +739,10 @@ class SmartHubAPI:
                             # Already tried refreshing, this is a persistent auth issue
                             raise SmartHubAuthenticationError("Authentication failed after token refresh")
                     elif response.status != 200:
-                        error_text = await response.text()
-                        _LOGGER.warning("HTTP error %d: %s", response.status, error_text)
+                        await response.read()
+                        _LOGGER.warning("HTTP error %d while requesting usage", response.status)
                         raise SmartHubConnectionError(
-                            f"HTTP error {response.status}: {error_text}"
+                            f"HTTP error {response.status}"
                         )
 
                     try:
@@ -592,8 +762,8 @@ class SmartHubAPI:
                             _LOGGER.warning("Maximum retries reached, data still PENDING")
                             return None
                     elif status == "COMPLETE":
-                        _LOGGER.debug("Successfully retrieved energy data")
-                        return self.parse_usage(response_json)
+                        _LOGGER.debug("Successfully retrieved usage data for %s", industries)
+                        return response_json
                     else:
                         _LOGGER.warning("Unexpected status in response: %s", status)
                         return None
