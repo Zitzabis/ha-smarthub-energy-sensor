@@ -11,6 +11,7 @@ CONF_HOST = "host"
 CONF_POLL_INTERVAL = "poll_interval"
 CONF_TIMEZONE = "timezone"
 CONF_MFA_TOTP = "mfa_totp"
+CONF_HISTORY_START = "history_start"
 
 # Default values
 DEFAULT_POLL_INTERVAL = 360  # 6 hour in minutes

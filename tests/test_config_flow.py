@@ -6,7 +6,7 @@ from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
-from custom_components.smarthub.const import DOMAIN
+from custom_components.smarthub.const import CONF_HISTORY_START, DOMAIN
 from custom_components.smarthub.exceptions import SmartHubAuthenticationError, SmartHubConnectionError
 
 async def test_form(hass: HomeAssistant) -> None:
@@ -36,6 +36,7 @@ async def test_form(hass: HomeAssistant) -> None:
                 "host": "test.smarthub.coop",
                 "timezone": "UTC",
                 "poll_interval": 360,
+                "history_start": "2026-01-01",
             },
         )
         await hass.async_block_till_done()
@@ -49,6 +50,7 @@ async def test_form(hass: HomeAssistant) -> None:
         "host": "test.smarthub.coop",
         "timezone": "UTC",
         "poll_interval": 360,
+        "history_start": "2026-01-01",
     }
     assert len(mock_setup_entry.mock_calls) == 1
 
@@ -75,6 +77,7 @@ async def test_form_invalid_auth(hass: HomeAssistant) -> None:
                 "host": "test.smarthub.coop",
                 "timezone": "UTC",
                 "poll_interval": 360,
+                "history_start": "2026-01-01",
             },
         )
 
@@ -104,6 +107,7 @@ async def test_form_cannot_connect(hass: HomeAssistant) -> None:
                 "host": "test.smarthub.coop",
                 "timezone": "UTC",
                 "poll_interval": 360,
+                "history_start": "2026-01-01",
             },
         )
 
@@ -133,8 +137,40 @@ async def test_form_unknown_exception(hass: HomeAssistant) -> None:
                 "host": "test.smarthub.coop",
                 "timezone": "UTC",
                 "poll_interval": 360,
+                "history_start": "2026-01-01",
             },
         )
 
     assert result2["type"] == FlowResultType.FORM
     assert result2["errors"] == {"base": "unknown"}
+
+
+async def test_form_rejects_future_history_start(hass: HomeAssistant) -> None:
+    """A history start after today is rejected before authentication."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "custom_components.smarthub.config_flow.SmartHubAPI.get_token",
+        return_value="test-token",
+    ) as get_token, patch(
+        "custom_components.smarthub.config_flow.SmartHubAPI.close",
+        return_value=None,
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "email": "test@example.com",
+                "password": "test-password",
+                "account_id": "12345",
+                "host": "test.smarthub.coop",
+                "timezone": "UTC",
+                "poll_interval": 360,
+                "history_start": "2099-01-01",
+            },
+        )
+
+    assert result2["type"] == FlowResultType.FORM
+    assert result2["errors"] == {CONF_HISTORY_START: "future_history_start"}
+    get_token.assert_not_called()

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 
@@ -57,6 +57,8 @@ from .const import (
     ATTR_ACCOUNT_ID,
     ATTR_LOCATION_ID,
     LOCATION_KEY,
+    CONF_HISTORY_START,
+    CONF_TIMEZONE,
     HISTORICAL_IMPORT_DAYS,
     WATER_HOURLY_REQUEST_DAYS,
     METER_NAME,
@@ -116,17 +118,19 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
         hass: HomeAssistant,
         api: SmartHubAPI,
         update_interval: timedelta,
-        config_entry: str,
+        config_entry: ConfigEntry,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=f"{DOMAIN}_{config_entry.entry_id}",
             update_interval=update_interval,
         )
         self.api = api
         self.account_id = config_entry.data.get('account_id','unknown')
+        self._history_satisfied: set[tuple[str, str]] = set()
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Fetch data from the SmartHub API."""
@@ -216,6 +220,80 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Unexpected error: {e}") from e
 
 
+    def _history_window_start(self) -> datetime:
+        """Earliest instant to import for this config entry."""
+        data = self.config_entry.data
+        return history_window_start(
+            data.get(CONF_HISTORY_START),
+            data.get(CONF_TIMEZONE, getattr(self.api, "timezone", "GMT")),
+        )
+
+    def _history_attempt_key(self, window_start: datetime) -> str:
+        """Identify a backfill attempt. A new date, or the next rolling day, tries again."""
+        configured = self.config_entry.data.get(CONF_HISTORY_START)
+        if configured:
+            return str(configured)
+        return window_start.date().isoformat()
+
+    async def _oldest_timestamp(self, statistic_id: str) -> float | None:
+        """Timestamp of the oldest stored row. External points are read at hour resolution."""
+        stats = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            datetime.fromtimestamp(0, tz=timezone.utc),
+            None,
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        rows = stats.get(statistic_id) or []
+        if not rows:
+            return None
+        return float(rows[0]["start"])
+
+    async def _choose_import_start(
+        self, statistic_id: str, _aggregation: Aggregation
+    ) -> tuple[datetime, bool, float | None]:
+        """Return the request start, whether sums restart at zero, and the oldest stored timestamp.
+
+        The full window is used when the statistic has no rows, or when the chosen
+        date is earlier than the oldest row. Otherwise the newest row is refreshed
+        with a two-day overlap.
+        """
+        window_start = self._history_window_start()
+        last_stat = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, set()
+        )
+        if not last_stat:
+            return window_start, True, None
+
+        attempt = (statistic_id, self._history_attempt_key(window_start))
+        oldest = None if attempt in self._history_satisfied else await self._oldest_timestamp(statistic_id)
+        if attempt in self._history_satisfied or (
+            oldest is not None and oldest <= _as_utc(window_start).timestamp() + 1
+        ):
+            newest = datetime.fromtimestamp(last_stat[statistic_id][0]["start"], tz=timezone.utc)
+            return newest - timedelta(days=2), False, None
+
+        return window_start, True, oldest
+
+    def _remember_if_no_older_data(
+        self, statistic_id: str, previous_oldest: float | None, data: dict | None
+    ) -> None:
+        """Stop repeating a full import when the portal has nothing older than what is stored."""
+        if previous_oldest is None:
+            return
+        window_start = self._history_window_start()
+        attempt = (statistic_id, self._history_attempt_key(window_start))
+        readings = []
+        if data:
+            readings.extend(data.get("USAGE") or [])
+            readings.extend(data.get("USAGE_RETURN") or [])
+        stamps = [reading.get("reading_time") for reading in readings if reading.get("reading_time") is not None]
+        if not stamps or min(stamp.timestamp() for stamp in stamps) >= previous_oldest - 1:
+            self._history_satisfied.add(attempt)
+
     # https://github.com/tronikos/opower/ was used as a model for how to populate
     # hourly metrics when access to realtime information is not possible via
     # utility dashboards.
@@ -250,64 +328,27 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             unit_of_measurement=consumption_unit,
         )
 
-        last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, consumption_statistic_id, True, set()
+        start_datetime, rebuild, previous_oldest = await self._choose_import_start(
+            consumption_statistic_id, aggregation
         )
-        _LOGGER.debug("last_stat for %s: %s", aggregation.label, last_stat)
+        _LOGGER.debug("Fetching %s statistics from %s", aggregation.label, start_datetime)
+        smarthub_data = await self._fetch_energy_usage(location, aggregation, start_datetime)
+        if rebuild:
+            self._remember_if_no_older_data(consumption_statistic_id, previous_oldest, smarthub_data)
 
-        smarthub_data = {}
-        if not last_stat:
-            _LOGGER.debug("Updating %s statistic for the first time", aggregation.label)
+        if not smarthub_data or not smarthub_data.get("USAGE"):
+            _LOGGER.warning(
+                "No data received from SmartHub API for location %s to populate historical %s stats",
+                location,
+                aggregation.label,
+            )
+            return
+
+        if rebuild:
             consumption_sum = 0.0
-            return_sum      = 0.0
+            return_sum = 0.0
             last_stats_time = None
-
-            # Initialize with last HISTORICAL_IMPORT_DAYS (usually 90) days of data
-            start_datetime = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
-
-            # Load read data for use in populating statistics
-            smarthub_data = await self.api.get_energy_data(location=location, aggregation=aggregation, start_datetime=start_datetime)
         else:
-            _LOGGER.debug("Checking if data migration is needed for %s...", aggregation.label)
-            migrated = False
-            # SmartHub doesn't hvae any current migrations - this sample code was left
-            # from the opower version
-            #migrated = await self._async_maybe_migrate_statistics(
-            #    account.utility_account_id,
-            #    {
-            #        cost_statistic_id: compensation_statistic_id,
-            #        consumption_statistic_id: return_statistic_id,
-            #    },
-            #    {
-            #        cost_statistic_id: cost_metadata,
-            #        compensation_statistic_id: compensation_metadata,
-            #        consumption_statistic_id: consumption_metadata,
-            #        return_metadata: return_metadata,
-            #    },
-            #)
-            if migrated:
-                # Skip update to avoid working on old data since the migration is done
-                # asynchronously. Update the statistics in the next refresh in 12h.
-                _LOGGER.debug(
-                    "Statistics migration completed. Skipping update for now"
-                )
-                return
-
-            # Update reads...
-            # Load read data for use in populating statistics
-            start_datetime = datetime.fromtimestamp(last_stat[consumption_statistic_id][0]["start"], tz=timezone.utc)
-
-            # always backdate the start_datetime to ensure no gaps in recorded data
-            start_datetime = start_datetime - timedelta(days=2)
-
-            _LOGGER.debug("Fetching %s statistics from %s", aggregation.label, start_datetime)
-            smarthub_data = await self.api.get_energy_data(location=location, start_datetime=start_datetime, aggregation=aggregation)
-
-            if not smarthub_data or not smarthub_data.get("USAGE"):
-              _LOGGER.warning("No data received from SmartHub API for location %s to populate historical %s stats", location, aggregation.label)
-              # No new data to record in statatistics
-              return
-
             start = smarthub_data.get("USAGE")[0].get("reading_time")
             _LOGGER.debug("Getting %s statistics at: %s", aggregation.label, start)
 
@@ -352,7 +393,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             return_sum    = _safe_get_sum(stats.get(return_statistic_id, []))
             last_stats_time = stats[consumption_statistic_id][0]["start"]
 
-            _LOGGER.info(f"Updating %s statistics since %s", aggregation.label, last_stats_time)
+            _LOGGER.info("Updating %s statistics since %s", aggregation.label, last_stats_time)
 
         consumption_statistics = []
         return_statistics      = []
@@ -427,7 +468,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
         return state
 
     async def _insert_water_statistics(self, location, aggregation: Aggregation):
-        """Import water with the same 90-day first run and two-day refresh as electricity.
+        """Import water from the configured start, then refresh the newest two days.
 
         Hourly water is requested in 30-day windows. Daily water stays one request.
         """
@@ -442,26 +483,19 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             unit_of_measurement=UnitOfVolume.CUBIC_FEET,
         )
 
-        last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, True, set()
-        )
-        _LOGGER.debug("last water stat: %s", last_stat)
+        start_datetime, rebuild, previous_oldest = await self._choose_import_start(statistic_id, aggregation)
+        _LOGGER.debug("Fetching water statistics from %s", start_datetime)
+        smarthub_data = await self._fetch_water_usage(location, aggregation, start_datetime)
+        if not smarthub_data or not smarthub_data.get("USAGE"):
+            if rebuild:
+                self._remember_if_no_older_data(statistic_id, previous_oldest, smarthub_data)
+            _LOGGER.warning("No water data received for location %s", location)
+            return
 
-        if not last_stat:
-            _LOGGER.debug("Updating water statistic for the first time")
+        if rebuild:
             consumption_sum = 0.0
             last_stats_time = None
-            start_datetime = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
-            smarthub_data = await self._fetch_water_usage(location, aggregation, start_datetime)
         else:
-            start_datetime = datetime.fromtimestamp(last_stat[statistic_id][0]["start"], tz=timezone.utc)
-            start_datetime = start_datetime - timedelta(days=2)
-            _LOGGER.debug("Fetching water statistics from %s", start_datetime)
-            smarthub_data = await self._fetch_water_usage(location, aggregation, start_datetime)
-            if not smarthub_data or not smarthub_data.get("USAGE"):
-                _LOGGER.warning("No water data received for location %s", location)
-                return
-
             start = smarthub_data.get("USAGE")[0].get("reading_time")
             for end in (start + timedelta(seconds=1), None):
                 stats = await get_instance(self.hass).async_add_executor_job(
@@ -483,6 +517,8 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             last_stats_time = stats[statistic_id][0]["start"]
 
         usage = dedupe_water_readings((smarthub_data or {}).get("USAGE", []))
+        if rebuild:
+            self._remember_if_no_older_data(statistic_id, previous_oldest, {"USAGE": usage})
         statistics = []
         for reading in usage:
             start = reading.get("reading_time")
@@ -503,6 +539,41 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Adding %s water statistics for %s", len(statistics), statistic_id)
         async_add_external_statistics(self.hass, metadata, statistics)
 
+    async def _fetch_energy_usage(self, location, aggregation: Aggregation, start_datetime: datetime):
+        """Load electricity usage. Hourly requests are split into portal-sized windows."""
+        if aggregation != Aggregation.HOURLY:
+            return await self.api.get_energy_data(
+                location=location, aggregation=aggregation, start_datetime=start_datetime
+            )
+
+        usage = []
+        usage_return = []
+        saw_return = False
+        meter_name = None
+        end_datetime = _usage_request_end(start_datetime)
+        for window_start, window_end in water_hourly_windows(start_datetime, end_datetime):
+            chunk = await self.api.get_energy_data(
+                location=location,
+                aggregation=aggregation,
+                start_datetime=window_start,
+                end_datetime=window_end,
+            )
+            if not chunk:
+                continue
+            if chunk.get(METER_NAME):
+                meter_name = chunk[METER_NAME]
+            usage.extend(chunk.get("USAGE") or [])
+            if "USAGE_RETURN" in chunk:
+                saw_return = True
+                usage_return.extend(chunk.get("USAGE_RETURN") or [])
+
+        result = {"USAGE": dedupe_readings(usage)}
+        if saw_return:
+            result["USAGE_RETURN"] = dedupe_readings(usage_return)
+        if meter_name:
+            result[METER_NAME] = meter_name
+        return result
+
     async def _fetch_water_usage(self, location, aggregation: Aggregation, start_datetime: datetime):
         """Load water usage. Hourly requests are split into portal-sized windows."""
         if aggregation != Aggregation.HOURLY:
@@ -512,7 +583,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
 
         usage = []
         meter_name = None
-        end_datetime = _water_request_end(start_datetime)
+        end_datetime = _usage_request_end(start_datetime)
         for window_start, window_end in water_hourly_windows(start_datetime, end_datetime):
             chunk = await self.api.get_water_data(
                 location=location,
@@ -533,11 +604,51 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
         return result
 
 
-def _water_request_end(start: datetime) -> datetime:
-    """End of a water request, truncated to the minute like the usage poll."""
+def history_window_start(history_start: str | None, timezone_name: str | None) -> datetime:
+    """Midnight of the selected date in the utility timezone.
+
+    Entries that have not chosen a date keep the rolling 90-day start.
+    """
+    if not history_start:
+        return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
+    if isinstance(history_start, datetime):
+        selected = history_start.date()
+    elif isinstance(history_start, date):
+        selected = history_start
+    else:
+        selected = date.fromisoformat(str(history_start))
+    return datetime(selected.year, selected.month, selected.day, tzinfo=ZoneInfo(timezone_name or "GMT"))
+
+
+def _as_utc(moment: datetime) -> datetime:
+    if moment.tzinfo is None:
+        return moment.astimezone(timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def _usage_request_end(start: datetime) -> datetime:
+    """End of a usage request, truncated to the minute like the usage poll."""
     if start.tzinfo is None:
         return datetime.now().replace(minute=0, second=0, microsecond=0)
     return datetime.now(start.tzinfo).replace(minute=0, second=0, microsecond=0)
+
+
+def dedupe_readings(usage: list) -> list:
+    """Keep one reading per source timestamp. A repeat uses the later value."""
+    deduped = []
+    index = {}
+    for reading in usage:
+        start = reading.get("reading_time")
+        if start is None:
+            continue
+        key = reading.get("raw_timestamp", int(start.timestamp() * 1000))
+        if key in index:
+            deduped[index[key]] = reading
+        else:
+            index[key] = len(deduped)
+            deduped.append(reading)
+    deduped.sort(key=lambda reading: reading.get("reading_time"))
+    return deduped
 
 
 def water_hourly_windows(start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
