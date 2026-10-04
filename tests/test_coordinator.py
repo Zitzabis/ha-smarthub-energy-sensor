@@ -10,7 +10,7 @@ from custom_components.smarthub import async_setup_entry
 from custom_components.smarthub.api import SmartHubAPI, SmartHubAPIError, SmartHubDataError, SmartHubLocation
 from custom_components.smarthub.const import DOMAIN, ELECTRIC_SERVICE, WATER_SENSOR_KEY
 
-from custom_components.smarthub.sensor import SmartHubDataUpdateCoordinator
+from custom_components.smarthub.sensor import SmartHubDataUpdateCoordinator, history_window_start
 from homeassistant.components.recorder import Recorder
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -23,11 +23,12 @@ from homeassistant.components.recorder.statistics import (
     statistics_during_period,
 )
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfVolume
 
 from custom_components.smarthub.api import Aggregation
-from custom_components.smarthub.const import HISTORICAL_IMPORT_DAYS
+from custom_components.smarthub.const import CONF_HISTORY_START, HISTORICAL_IMPORT_DAYS
 
 
 from homeassistant.components.recorder import get_instance
@@ -350,7 +351,8 @@ async def test_water_initial_import_is_90_days_when_electricity_already_exists(
         has_water=True,
     )
     mock_smarthub_api.get_service_locations.return_value = [location]
-    seeded = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    expected_initial = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
+    seeded = expected_initial.astimezone()
     await _seed_statistic(
         hass, "smarthub:smarthub_energy_sensor_123456_11111", seeded, "kWh", "energy"
     )
@@ -361,8 +363,8 @@ async def test_water_initial_import_is_90_days_when_electricity_already_exists(
     electric_calls = []
     water_calls = []
 
-    async def get_energy_data(location, aggregation, start_datetime=None, **kwargs):
-        electric_calls.append((aggregation, start_datetime))
+    async def get_energy_data(location, aggregation, start_datetime=None, end_datetime=None, **kwargs):
+        electric_calls.append((aggregation, start_datetime, end_datetime))
         return {"USAGE": [_usage_at(seeded, 1)], "meter_name": "series-forward"}
 
     async def get_water_data(location, aggregation, start_datetime=None, end_datetime=None, **kwargs):
@@ -378,12 +380,13 @@ async def test_water_initial_import_is_90_days_when_electricity_already_exists(
     await coordinator._async_update_data()
 
     expected_refresh = seeded - timedelta(days=2)
-    expected_initial = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
-    electric_windows = [start for aggregation, start in electric_calls if aggregation in (Aggregation.HOURLY, Aggregation.DAILY)]
+    electric_hourly = [(start, end) for aggregation, start, end in electric_calls if aggregation == Aggregation.HOURLY]
+    electric_daily = [start for aggregation, start, end in electric_calls if aggregation == Aggregation.DAILY]
     water_daily = [start for aggregation, start, end in water_calls if aggregation == Aggregation.DAILY]
     water_hourly = [(start, end) for aggregation, start, end in water_calls if aggregation == Aggregation.HOURLY]
-    assert electric_windows
-    assert all(start == expected_refresh for start in electric_windows)
+    assert electric_hourly[0][0] == expected_refresh
+    assert electric_daily == [expected_refresh]
+    _assert_chunked_hourly_windows(electric_hourly)
     assert water_daily == [expected_initial]
     assert water_hourly[0][0] == expected_initial
     _assert_chunked_hourly_windows(water_hourly)
@@ -404,7 +407,8 @@ async def test_existing_water_statistics_use_two_day_lookback(
         has_water=True,
     )
     mock_smarthub_api.get_service_locations.return_value = [location]
-    seeded = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    expected_initial = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
+    seeded = expected_initial.astimezone()
     await _seed_statistic(
         hass,
         "smarthub:smarthub_water_sensor_daily_123456_11111",
@@ -431,7 +435,6 @@ async def test_existing_water_statistics_use_two_day_lookback(
 
     water_daily = [start for aggregation, start, end in water_calls if aggregation == Aggregation.DAILY]
     water_hourly = [(start, end) for aggregation, start, end in water_calls if aggregation == Aggregation.HOURLY]
-    expected_initial = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
     assert water_daily == [seeded - timedelta(days=2)]
     assert water_hourly[0][0] == expected_initial
     _assert_chunked_hourly_windows(water_hourly)
@@ -515,7 +518,8 @@ async def test_existing_hourly_water_statistics_use_two_day_lookback(
         has_water=True,
     )
     mock_smarthub_api.get_service_locations.return_value = [location]
-    seeded = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    expected_initial = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
+    seeded = expected_initial.astimezone()
     await _seed_statistic(
         hass,
         "smarthub:smarthub_water_sensor_123456_11111",
@@ -542,7 +546,6 @@ async def test_existing_hourly_water_statistics_use_two_day_lookback(
 
     water_hourly = [(start, end) for aggregation, start, end in water_calls if aggregation == Aggregation.HOURLY]
     water_daily = [start for aggregation, start, end in water_calls if aggregation == Aggregation.DAILY]
-    expected_initial = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
     assert water_hourly[0][0] == seeded - timedelta(days=2)
     _assert_chunked_hourly_windows(water_hourly)
     assert water_daily == [expected_initial]
@@ -623,6 +626,165 @@ async def test_monthly_water_failure_still_updates_electricity(
 
     assert result["11111"]["current_energy_usage"] == 5
     assert WATER_SENSOR_KEY not in result["11111"]
+
+
+def _config_with_history(mock_config_entry: MockConfigEntry, history_start: str) -> MockConfigEntry:
+    data = dict(mock_config_entry.data)
+    data[CONF_HISTORY_START] = history_start
+    data["timezone"] = "UTC"
+    return MockConfigEntry(
+        version=1,
+        domain=DOMAIN,
+        title="SmartHub Test",
+        data=data,
+        unique_id=f"{mock_config_entry.unique_id}_{history_start}",
+    )
+
+
+def test_history_window_start_uses_utility_midnight() -> None:
+    """The saved date is midnight in the utility timezone and does not roll forward."""
+    start = history_window_start("2026-01-15", "America/New_York")
+    assert start == datetime(2026, 1, 15, tzinfo=ZoneInfo("America/New_York"))
+    rolling = history_window_start(None, "UTC")
+    assert rolling.tzinfo is None
+    assert rolling.hour == 0 and rolling.minute == 0 and rolling.second == 0
+
+
+async def test_chosen_history_start_is_requested_on_first_import(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """A configured date replaces the rolling 90-day first import."""
+    entry = _config_with_history(mock_config_entry, "2026-06-01")
+    location = SmartHubLocation(
+        id="11111",
+        service=ELECTRIC_SERVICE,
+        description="test location",
+        provider="test provider",
+    )
+    mock_smarthub_api.get_service_locations.return_value = [location]
+    calls = []
+    expected = history_window_start("2026-06-01", "UTC")
+
+    async def get_energy_data(location, aggregation, start_datetime=None, end_datetime=None, **kwargs):
+        calls.append((aggregation, start_datetime, end_datetime))
+        return {"USAGE": [_usage_at(expected, 1)]}
+
+    mock_smarthub_api.get_energy_data.side_effect = get_energy_data
+    coordinator = SmartHubDataUpdateCoordinator(
+        hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720), config_entry=entry
+    )
+    await coordinator._async_update_data()
+
+    hourly = [(start, end) for aggregation, start, end in calls if aggregation == Aggregation.HOURLY]
+    daily = [start for aggregation, start, end in calls if aggregation == Aggregation.DAILY]
+    assert hourly[0][0] == expected
+    assert daily == [expected]
+    _assert_chunked_hourly_windows(hourly)
+
+
+async def test_earlier_history_start_extends_existing_statistics(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """An earlier date is imported once. The following poll returns to the two-day refresh."""
+    entry = _config_with_history(mock_config_entry, "2026-01-01")
+    location = SmartHubLocation(
+        id="11111",
+        service=ELECTRIC_SERVICE,
+        description="test location",
+        provider="test provider",
+    )
+    mock_smarthub_api.get_service_locations.return_value = [location]
+    seeded = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await _seed_statistic(hass, "smarthub:smarthub_energy_sensor_123456_11111", seeded, "kWh", "energy")
+    await _seed_statistic(hass, "smarthub:smarthub_energy_sensor_daily_123456_11111", seeded, "kWh", "energy")
+    calls = []
+
+    async def get_energy_data(location, aggregation, start_datetime=None, end_datetime=None, **kwargs):
+        calls.append((aggregation, start_datetime, end_datetime))
+        return {"USAGE": [_usage_at(seeded, 1)]}
+
+    mock_smarthub_api.get_energy_data.side_effect = get_energy_data
+    coordinator = SmartHubDataUpdateCoordinator(
+        hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720), config_entry=entry
+    )
+    await coordinator._async_update_data()
+
+    expected = history_window_start("2026-01-01", "UTC")
+    hourly = [(start, end) for aggregation, start, end in calls if aggregation == Aggregation.HOURLY]
+    daily = [start for aggregation, start, end in calls if aggregation == Aggregation.DAILY]
+    assert hourly[0][0] == expected
+    assert daily == [expected]
+    _assert_chunked_hourly_windows(hourly)
+
+    calls.clear()
+    await coordinator._async_update_data()
+    refresh = seeded - timedelta(days=2)
+    hourly = [(start, end) for aggregation, start, end in calls if aggregation == Aggregation.HOURLY]
+    daily = [start for aggregation, start, end in calls if aggregation == Aggregation.DAILY]
+    assert hourly[0][0] == refresh
+    assert daily == [refresh]
+    _assert_chunked_hourly_windows(hourly)
+
+
+async def test_later_history_start_keeps_older_rows(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """Choosing a later date refreshes recent rows and leaves older statistics in place."""
+    entry = _config_with_history(mock_config_entry, "2026-09-01")
+    location = SmartHubLocation(
+        id="11111",
+        service=ELECTRIC_SERVICE,
+        description="test location",
+        provider="test provider",
+    )
+    mock_smarthub_api.get_service_locations.return_value = [location]
+    seeded = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    statistic_id = "smarthub:smarthub_energy_sensor_daily_123456_11111"
+    await _seed_statistic(hass, "smarthub:smarthub_energy_sensor_123456_11111", seeded, "kWh", "energy")
+    await _seed_statistic(hass, statistic_id, seeded, "kWh", "energy")
+    calls = []
+
+    async def get_energy_data(location, aggregation, start_datetime=None, end_datetime=None, **kwargs):
+        calls.append((aggregation, start_datetime))
+        if aggregation == Aggregation.MONTHLY:
+            return {"USAGE": [_usage_at(seeded, 4)]}
+        return {"USAGE": []}
+
+    mock_smarthub_api.get_energy_data.side_effect = get_energy_data
+    coordinator = SmartHubDataUpdateCoordinator(
+        hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720), config_entry=entry
+    )
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    refresh = seeded - timedelta(days=2)
+    daily = [start for aggregation, start in calls if aggregation == Aggregation.DAILY]
+    assert daily == [refresh]
+    assert history_window_start("2026-09-01", "UTC") not in daily
+
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utc_from_timestamp(0),
+        None,
+        {statistic_id},
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+    rows = stats[statistic_id]
+    assert len(rows) == 1
+    assert rows[0]["start"] == pytest.approx(seeded.timestamp())
+    assert rows[0]["sum"] == 1.0
 
 
 def _assert_chunked_hourly_windows(hourly) -> None:

@@ -628,10 +628,11 @@ class SmartHubAPI:
         location,
         aggregation: Aggregation,
         start_datetime=None,
+        end_datetime=None,
     ) -> Optional[Dict[str, Any]]:
         """Retrieve electricity usage."""
         response_json = await self._poll_usage(
-            location, aggregation, start_datetime, None, [ELECTRIC_INDUSTRY]
+            location, aggregation, start_datetime, end_datetime, [ELECTRIC_INDUSTRY]
         )
         if response_json is None:
             return None

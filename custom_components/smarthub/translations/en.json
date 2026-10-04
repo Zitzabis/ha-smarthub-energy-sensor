@@ -9,12 +9,15 @@
           "account_id": "Account ID",
           "host": "SmartHub Host",
           "timezone": "Timezone for power company",
-          "mfa_totp": "MFA TOTP Seed"
+          "mfa_totp": "MFA TOTP Seed",
+          "poll_interval": "Poll interval (minutes)",
+          "history_start": "Earliest day to import"
         },
         "data_description" : {
           "host": "e.g XXXXXX.smarthub.coop",
           "timezone": "Timezone for power company",
-          "mfa_totp": "MFA TOTP Seed - only required if using MFA"
+          "mfa_totp": "MFA TOTP Seed - only required if using MFA",
+          "history_start": "Import usage back to this date. Later updates refresh recent days. Moving the date earlier fills in older history on the next update."
         }
       }
     },
@@ -22,7 +25,9 @@
       "cannot_connect": "Failed to connect to SmartHub. Please check your host and network connection.",
       "invalid_auth": "Invalid credentials. Please check your email and password.",
       "invalid_input": "Invalid input provided. Please check all fields.",
-      "unknown": "Unexpected error occurred. Please check the logs."
+      "unknown": "Unexpected error occurred. Please check the logs.",
+      "invalid_history_start": "Enter a valid date.",
+      "future_history_start": "The earliest day to import cannot be in the future."
     },
     "abort": {
       "already_configured": "SmartHub integration is already configured for this account and host."

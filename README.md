@@ -114,7 +114,7 @@ In the Energy dashboard set the Grid Consumption entry to the "usage" statistic,
 
 When the SmartHub location has water as well as electricity, usage is imported in cubic feet (ft³). There is no water return or net statistic.
 
-The first import covers 90 days. Later updates refresh the recent days. Hourly water is requested in 30-day windows, matching the portal's interval view.
+The first import goes back to the earliest day you choose. The form suggests 90 days before today. Later updates refresh the recent days. If you move that date earlier, the next update fills in the older history. Hourly usage is requested in 30-day windows, matching the portal's interval view.
 
 - **Hourly and daily statistics** hold the historical usage.
 - **Monthly sensor** shows the current month's total. Like the electricity entity, this is the month-to-date value from the latest poll, not the historical series.
@@ -135,6 +135,8 @@ The first import covers 90 days. Later updates refresh the recent days. Hourly w
 ## 🔧 Configuration Options
 
 By default, the integration will poll the SmartHub API every 6 hours. You can adjust this when re-configuring the integration to between 15-1440 minutes.
+
+**Earliest day to import** chooses how far back usage is recorded. The form suggests 90 days before today, and the saved value stays on that calendar date. The first import requests history from midnight of that date in the utility timezone. After stored history reaches that date, updates refresh the last two days. Moving the date earlier backfills the gap on the next update. Moving it later leaves statistics that are already stored. An existing installation that has not set a date keeps a 90-day first import.
 
 **Note**: SmartHub data typically updates every 15-60 minutes, so setting a very low poll interval may not provide more frequent updates but will increase API calls.
 
