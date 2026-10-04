@@ -1,0 +1,65 @@
+{
+  "status": "COMPLETE",
+  "data": {
+    "WATER": [
+      {
+        "timeFrame": "HOURLY",
+        "industry": "WATER",
+        "unitOfMeasure": "FT3",
+        "type": "USAGE",
+        "series": [
+          {
+            "name": "meter-water",
+            "meterNumber": "meter-water",
+            "data": [
+              {"x": 1704067200000, "y": 3},
+              {"x": 1704070800000, "y": 0},
+              {"x": 1704074400000, "y": 1}
+            ]
+          }
+        ],
+        "baseSeries": {
+          "name": "BASE_SERIES",
+          "data": [
+            {"x": 1704067200000, "y": 3},
+            {"x": 1704070800000, "y": 0},
+            {"x": 1704074400000, "y": 1}
+          ]
+        },
+        "meters": [
+          {
+            "meterNumber": "meter-water",
+            "seriesId": "meter-water",
+            "flowDirection": "FORWARD",
+            "unitOfMeasure": "FT3"
+          }
+        ],
+        "meterToChartData": {
+          "meter-water": [
+            {"x": 1704067200000, "y": 99},
+            {"x": 1704070800000, "y": 99},
+            {"x": 1704074400000, "y": 99}
+          ]
+        }
+      }
+    ],
+    "ELECTRIC": [
+      {
+        "type": "USAGE",
+        "meters": [
+          {
+            "meterNumber": "meter-electric",
+            "seriesId": "series-electric",
+            "flowDirection": "TOTAL"
+          }
+        ],
+        "series": [
+          {
+            "name": "series-electric",
+            "data": [{"x": 1704067200000, "y": 10}]
+          }
+        ]
+      }
+    ]
+  }
+}

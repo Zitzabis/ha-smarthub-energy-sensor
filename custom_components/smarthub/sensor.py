@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfEnergy
+from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
@@ -20,7 +20,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
-from homeassistant.util.unit_conversion import EnergyConverter
+from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
@@ -51,11 +51,14 @@ from .exceptions import (
 from .const import (
     DOMAIN,
     ENERGY_SENSOR_KEY,
+    WATER_SENSOR_KEY,
     ATTR_LAST_READING_TIME,
+    ATTR_WATER_LAST_READING_TIME,
     ATTR_ACCOUNT_ID,
     ATTR_LOCATION_ID,
     LOCATION_KEY,
     HISTORICAL_IMPORT_DAYS,
+    WATER_HOURLY_REQUEST_DAYS,
     METER_NAME,
 )
 
@@ -82,14 +85,24 @@ async def async_setup_entry(
     # Create sensor entities for each location
     entities = []
     for last_consumption in last_locations_consumption:
+      location = last_consumption.get(LOCATION_KEY)
       entities.append(
           SmartHubEnergySensor(
               coordinator=coordinator,
               config_entry=config_entry,
               config=config,
-              location=last_consumption.get(LOCATION_KEY),
+              location=location,
           )
       )
+      if getattr(location, "has_water", False):
+          entities.append(
+              SmartHubWaterSensor(
+                  coordinator=coordinator,
+                  config_entry=config_entry,
+                  config=config,
+                  location=location,
+              )
+          )
 
     async_add_entities(entities)
     _LOGGER.debug(f"{len(entities)} SmartHub sensor entities added successfully")
@@ -132,6 +145,18 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
               # number of hours we need to insert data into statistics.
               await self._insert_statistics(location, Aggregation.HOURLY)
               await self._insert_statistics(location, Aggregation.DAILY)
+              if getattr(location, "has_water", False):
+                  for water_aggregation in (Aggregation.HOURLY, Aggregation.DAILY):
+                      try:
+                          await self._insert_water_statistics(location, water_aggregation)
+                      except SmartHubAuthenticationError:
+                          raise
+                      except SmartHubAPIError:
+                          _LOGGER.exception(
+                              "Water %s import failed for location %s",
+                              water_aggregation.label,
+                              location.id,
+                          )
 
               # Fetch monthly information for entity value
               first_day_of_current_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -141,23 +166,40 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
               if data.get("USAGE", None) is None or len(data.get("USAGE", None)) == 0:
                   _LOGGER.warning("No data received from SmartHub API for location %s", location)
                   # Return previous data if available, otherwise empty dict
-                  entity_response[location.id] = {
+                  entity = {
                     ENERGY_SENSOR_KEY: 0, # no data - no energy usage for the entity.
                     ATTR_LAST_READING_TIME: first_day_of_current_month.replace(tzinfo=ZoneInfo(self.api.timezone)), # use the TZ from the entity so it has consistent formating like 2026-02-01T00:00:00-05:00
                     LOCATION_KEY: location,
                     METER_NAME: data.get(METER_NAME, None)
                   }
-                  continue
+              else:
+                  last_reading = data.get("USAGE")[-1]
+                  _LOGGER.debug("Successfully fetched data: %s for location: %s", last_reading, location)
 
-              last_reading = data.get("USAGE")[-1]
-              _LOGGER.debug("Successfully fetched data: %s for location: %s", last_reading, location)
+                  entity = {
+                    ENERGY_SENSOR_KEY: last_reading['consumption'],
+                    ATTR_LAST_READING_TIME: last_reading['reading_time'],
+                    LOCATION_KEY: location,
+                    METER_NAME: data.get(METER_NAME, None)
+                  }
 
-              entity_response[location.id] = {
-                ENERGY_SENSOR_KEY: last_reading['consumption'],
-                ATTR_LAST_READING_TIME: last_reading['reading_time'],
-                LOCATION_KEY: location,
-                METER_NAME: data.get(METER_NAME, None)
-              }
+              if getattr(location, "has_water", False):
+                  try:
+                      water_data = await self.api.get_water_data(
+                          location=location,
+                          start_datetime=first_day_of_current_month,
+                          aggregation=Aggregation.MONTHLY,
+                      )
+                      entity.update(self._monthly_water_state(water_data, first_day_of_current_month))
+                  except SmartHubAuthenticationError:
+                      raise
+                  except SmartHubAPIError:
+                      _LOGGER.exception(
+                          "Water monthly update failed for location %s",
+                          location.id,
+                      )
+
+              entity_response[location.id] = entity
 
             return entity_response
 
@@ -367,6 +409,179 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             self.hass, return_metadata, return_statistics
           )
 
+    def _monthly_water_state(self, water_data, first_day: datetime) -> Dict[str, Any]:
+        """Monthly water sensor state, matching the empty-month behavior of electricity."""
+        if not water_data or not water_data.get("USAGE"):
+            return {
+                WATER_SENSOR_KEY: 0,
+                ATTR_WATER_LAST_READING_TIME: first_day.replace(tzinfo=ZoneInfo(self.api.timezone)),
+            }
+        last_reading = water_data["USAGE"][-1]
+        state = {
+            WATER_SENSOR_KEY: last_reading["consumption"],
+            ATTR_WATER_LAST_READING_TIME: last_reading["reading_time"],
+        }
+        meter_name = water_data.get(METER_NAME)
+        if meter_name:
+            state["water_meter_name"] = meter_name
+        return state
+
+    async def _insert_water_statistics(self, location, aggregation: Aggregation):
+        """Import water with the same 90-day first run and two-day refresh as electricity.
+
+        Hourly water is requested in 30-day windows. Daily water stays one request.
+        """
+        statistic_id = f"{DOMAIN}:smarthub_water_sensor{aggregation.suffix}_{self.account_id}_{location.id}"
+        metadata = StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=f"{location.provider} SmartHub Water {aggregation.label} Usage - {self.account_id} - {location.description}",
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_class=VolumeConverter.UNIT_CLASS,
+            unit_of_measurement=UnitOfVolume.CUBIC_FEET,
+        )
+
+        last_stat = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, set()
+        )
+        _LOGGER.debug("last water stat: %s", last_stat)
+
+        if not last_stat:
+            _LOGGER.debug("Updating water statistic for the first time")
+            consumption_sum = 0.0
+            last_stats_time = None
+            start_datetime = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
+            smarthub_data = await self._fetch_water_usage(location, aggregation, start_datetime)
+        else:
+            start_datetime = datetime.fromtimestamp(last_stat[statistic_id][0]["start"], tz=timezone.utc)
+            start_datetime = start_datetime - timedelta(days=2)
+            _LOGGER.debug("Fetching water statistics from %s", start_datetime)
+            smarthub_data = await self._fetch_water_usage(location, aggregation, start_datetime)
+            if not smarthub_data or not smarthub_data.get("USAGE"):
+                _LOGGER.warning("No water data received for location %s", location)
+                return
+
+            start = smarthub_data.get("USAGE")[0].get("reading_time")
+            for end in (start + timedelta(seconds=1), None):
+                stats = await get_instance(self.hass).async_add_executor_job(
+                    statistics_during_period,
+                    self.hass,
+                    start,
+                    end,
+                    {statistic_id},
+                    aggregation.period,
+                    None,
+                    {"sum"},
+                )
+                if stats:
+                    break
+            assert stats
+
+            records = stats.get(statistic_id, [])
+            consumption_sum = float(records[0]["sum"]) if records and "sum" in records[0] else 0.0
+            last_stats_time = stats[statistic_id][0]["start"]
+
+        usage = dedupe_water_readings((smarthub_data or {}).get("USAGE", []))
+        statistics = []
+        for reading in usage:
+            start = reading.get("reading_time")
+            if last_stats_time is not None and start.timestamp() <= last_stats_time:
+                continue
+            consumption_state = max(0, reading.get("consumption"))
+            consumption_sum += consumption_state
+            statistics.append(
+                StatisticData(start=start, state=consumption_state, sum=consumption_sum)
+            )
+
+        if location.description == "":
+            metadata["name"] = (
+                f"{location.provider} SmartHub Water {aggregation.label} Usage - "
+                f"{self.account_id} - {(smarthub_data or {}).get(METER_NAME, None)}"
+            )
+
+        _LOGGER.info("Adding %s water statistics for %s", len(statistics), statistic_id)
+        async_add_external_statistics(self.hass, metadata, statistics)
+
+    async def _fetch_water_usage(self, location, aggregation: Aggregation, start_datetime: datetime):
+        """Load water usage. Hourly requests are split into portal-sized windows."""
+        if aggregation != Aggregation.HOURLY:
+            return await self.api.get_water_data(
+                location=location, aggregation=aggregation, start_datetime=start_datetime
+            )
+
+        usage = []
+        meter_name = None
+        end_datetime = _water_request_end(start_datetime)
+        for window_start, window_end in water_hourly_windows(start_datetime, end_datetime):
+            chunk = await self.api.get_water_data(
+                location=location,
+                aggregation=aggregation,
+                start_datetime=window_start,
+                end_datetime=window_end,
+            )
+            if not chunk:
+                continue
+            if chunk.get(METER_NAME):
+                meter_name = chunk[METER_NAME]
+            usage.extend(chunk.get("USAGE") or [])
+        usage.sort(key=lambda reading: reading.get("reading_time"))
+
+        result = {"USAGE": usage}
+        if meter_name:
+            result[METER_NAME] = meter_name
+        return result
+
+
+def _water_request_end(start: datetime) -> datetime:
+    """End of a water request, truncated to the minute like the usage poll."""
+    if start.tzinfo is None:
+        return datetime.now().replace(minute=0, second=0, microsecond=0)
+    return datetime.now(start.tzinfo).replace(minute=0, second=0, microsecond=0)
+
+
+def water_hourly_windows(start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
+    """Split an hourly water span into windows of at most 30 days."""
+    windows = []
+    cursor = start
+    while cursor < end:
+        chunk_end = cursor + timedelta(days=WATER_HOURLY_REQUEST_DAYS)
+        if chunk_end > end:
+            chunk_end = end
+        if chunk_end <= cursor:
+            break
+        windows.append((cursor, chunk_end))
+        cursor = chunk_end
+    return windows
+
+
+def dedupe_water_readings(usage: list) -> list:
+    """Drop misaligned points and keep one reading per source timestamp.
+
+    A repeated timestamp uses the later value so it is not added into the sum twice.
+    """
+    deduped = []
+    index = {}
+    for reading in usage:
+        start = reading.get("reading_time")
+        if (
+            start is None
+            or getattr(start, "tzinfo", None) is None
+            or start.utcoffset() is None
+            or start.minute != 0
+            or start.second != 0
+            or start.microsecond != 0
+        ):
+            _LOGGER.warning("Skipping water reading that is not on an hour boundary")
+            continue
+        key = reading.get("raw_timestamp", int(start.timestamp() * 1000))
+        if key in index:
+            deduped[index[key]] = reading
+        else:
+            index[key] = len(deduped)
+            deduped.append(reading)
+    return deduped
+
 
 class SmartHubEnergySensor(CoordinatorEntity, SensorEntity):
     """Representation of a SmartHub energy sensor."""
@@ -446,6 +661,78 @@ class SmartHubEnergySensor(CoordinatorEntity, SensorEntity):
         account_id = self._config.get("account_id", "Unknown")
         host = self._config.get("host", "Unknown")
 
+        return {
+            "identifiers": {(DOMAIN, self._config_entry.unique_id or self._config_entry.entry_id)},
+            "name": f"{self.location.provider} SmartHub Energy Monthly Usage ({account_id} - {self.location.description})",
+            "manufacturer": "SmartHub Coop",
+            "model": "Energy Monitor",
+            "configuration_url": f"https://{host}",
+        }
+
+
+class SmartHubWaterSensor(CoordinatorEntity, SensorEntity):
+    """Monthly water consumption for a location that also has electricity."""
+
+    _attr_device_class = SensorDeviceClass.WATER
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfVolume.CUBIC_FEET
+    _attr_icon = "mdi:water"
+
+    def __init__(
+        self,
+        coordinator: SmartHubDataUpdateCoordinator,
+        config_entry: ConfigEntry,
+        config: Dict[str, Any],
+        location: SmartHubLocation,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._config = config
+        self.location = location
+        self._attr_unique_id = f"{config_entry.unique_id}_{location.id}_water"
+        account_id = config.get("account_id", "Unknown")
+        self._attr_name = (
+            f"{location.provider} SmartHub Water Monthly Usage - {account_id} {location.description}"
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        return self.coordinator.last_update_success and self.native_value is not None
+
+    @property
+    def native_value(self) -> Optional[float]:
+        """Return the current monthly water consumption."""
+        if not self.coordinator.data:
+            return None
+        value = self.coordinator.data.get(self.location.id, {}).get(WATER_SENSOR_KEY)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        """Return additional state attributes."""
+        attributes = {
+            ATTR_ACCOUNT_ID: self._config.get("account_id"),
+            ATTR_LOCATION_ID: self.location.id,
+        }
+        location_data = (self.coordinator.data or {}).get(self.location.id) or {}
+        if location_data.get(ATTR_WATER_LAST_READING_TIME):
+            attributes[ATTR_WATER_LAST_READING_TIME] = location_data[ATTR_WATER_LAST_READING_TIME]
+        if location_data.get("water_meter_name"):
+            attributes[METER_NAME] = location_data["water_meter_name"]
+        return attributes
+
+    @property
+    def device_info(self) -> Dict[str, Any]:
+        """Return device information for the shared service location."""
+        account_id = self._config.get("account_id", "Unknown")
+        host = self._config.get("host", "Unknown")
         return {
             "identifiers": {(DOMAIN, self._config_entry.unique_id or self._config_entry.entry_id)},
             "name": f"{self.location.provider} SmartHub Energy Monthly Usage ({account_id} - {self.location.description})",

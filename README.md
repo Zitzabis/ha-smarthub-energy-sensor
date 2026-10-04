@@ -4,12 +4,13 @@
 [![Version](https://img.shields.io/github/v/release/gagata/ha-smarthub-energy-sensor)](https://github.com/gagata/ha-smarthub-energy-sensor/releases)
 [![License](https://img.shields.io/github/license/gagata/ha-smarthub-energy-sensor)](LICENSE)
 
-A Home Assistant custom integration that connects to SmartHub Coop energy portals to download the hourly or daily usage information. The integration populates historical electricity usage data, but does not show realtime data as that information is not available in SmartHub Coop energy portals. This integration is fully compatible with Home Assistant's Energy Dashboard, Net Mettering and provides reliable, stable monitoring for your energy consumption.
+A Home Assistant custom integration that connects to SmartHub Coop portals to download hourly and daily usage. It stores historical electricity and water usage, and does not show realtime data, because SmartHub portals do not provide it. Electricity works with Home Assistant's Energy Dashboard, including net metering. Water is stored in cubic feet for a location that has both electricity and water service.
 
 ## ✨ Features
 
 - 🔌 **Energy Dashboard Integration**: Seamlessly works with Home Assistant's built-in Energy Dashboard, including backfilling hourly metrics
-- 📊 **Periodic Monitoring**: Tracks your electricity usage with configurable polling intervals
+- 💧 **Water Usage**: Hourly and daily water statistics, plus a monthly water sensor, in cubic feet
+- 📊 **Periodic Monitoring**: Tracks electricity and water usage with configurable polling intervals
 - 🔒 **Secure Authentication**: Robust credential handling with proper error management including Multi Factor Auth support
 - 🔄 **Automatic Retry**: Built-in retry logic for reliable data collection
 - 🎛️ **Easy Configuration**: User-friendly configuration flow with input validation
@@ -81,7 +82,7 @@ Before setting up the integration, you'll need to gather the following informati
    - Set the TimeZone for your meter
    - Adjust the polling interval for how often it should query for new usage information
 
-The integration will validate your credentials and create the energy sensor automatically.
+The integration will validate your credentials and create the energy sensor automatically. A water sensor is added when that location also has water service.
 
 ## 📊 Energy Dashboard Integration
 
@@ -109,6 +110,28 @@ In the Energy dashboard set the Grid Consumption entry to the "usage" statistic,
 - **Unit**: kWh (Kilowatt Hours)
 - **Icon**: Lightning bolt (mdi:lightning-bolt)
 
+## 💧 Water
+
+When the SmartHub location has water as well as electricity, usage is imported in cubic feet (ft³). There is no water return or net statistic.
+
+The first import covers 90 days. Later updates refresh the recent days. Hourly water is requested in 30-day windows, matching the portal's interval view.
+
+- **Hourly and daily statistics** hold the historical usage.
+- **Monthly sensor** shows the current month's total. Like the electricity entity, this is the month-to-date value from the latest poll, not the historical series.
+
+### Adding water to the Energy Dashboard
+
+1. Go to **Settings** → **Dashboards** → **Energy**
+2. Open the **Water** section and add a water source
+3. Select a SmartHub water statistic (hourly or daily). The monthly entity only stores the value seen at each poll.
+
+### Sensor Details
+
+- **Device Class**: Water
+- **State Class**: Total Increasing
+- **Unit**: ft³ (cubic feet)
+- **Icon**: Water (mdi:water)
+
 ## 🔧 Configuration Options
 
 By default, the integration will poll the SmartHub API every 6 hours. You can adjust this when re-configuring the integration to between 15-1440 minutes.
@@ -120,7 +143,7 @@ By default, the integration will poll the SmartHub API every 6 hours. You can ad
 ### Common Issues
 
 **Entity Not showing historical information**
-- This is expected - the entity only stores the monthly value at the time it was polled. The integration also populates a historical `statistic` which aligns the time of use with the time the energy usage actually happened.
+- This is expected. The entity only stores the monthly value at the time it was polled. The integration also populates a historical statistic, which aligns the reading with the time the electricity or water use actually happened.
 
 **"Cannot Connect" Error**
 - Verify your SmartHub host is correct (without http:// or https://)
@@ -198,7 +221,8 @@ Contributions are welcome! Please follow these guidelines:
 
 - Data availability depends on your energy provider's SmartHub implementation
 - Update frequency is limited by the provider's data refresh rate
-- Currently supports electricity usage only (no gas or other utilities)
+- Supports electricity and water. Gas and other utilities are not imported
+- Water is recorded in cubic feet, as reported by the portal
 - Requires active SmartHub portal access
 
 
