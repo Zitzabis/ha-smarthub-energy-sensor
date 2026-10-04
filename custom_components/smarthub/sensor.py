@@ -151,7 +151,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
                           await self._insert_water_statistics(location, water_aggregation)
                       except SmartHubAuthenticationError:
                           raise
-                      except Exception:
+                      except SmartHubAPIError:
                           _LOGGER.exception(
                               "Water %s import failed for location %s",
                               water_aggregation.label,
@@ -184,12 +184,20 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
                   }
 
               if getattr(location, "has_water", False):
-                  water_data = await self.api.get_water_data(
-                      location=location,
-                      start_datetime=first_day_of_current_month,
-                      aggregation=Aggregation.MONTHLY,
-                  )
-                  entity.update(self._monthly_water_state(water_data, first_day_of_current_month))
+                  try:
+                      water_data = await self.api.get_water_data(
+                          location=location,
+                          start_datetime=first_day_of_current_month,
+                          aggregation=Aggregation.MONTHLY,
+                      )
+                      entity.update(self._monthly_water_state(water_data, first_day_of_current_month))
+                  except SmartHubAuthenticationError:
+                      raise
+                  except SmartHubAPIError:
+                      _LOGGER.exception(
+                          "Water monthly update failed for location %s",
+                          location.id,
+                      )
 
               entity_response[location.id] = entity
 
@@ -727,8 +735,8 @@ class SmartHubWaterSensor(CoordinatorEntity, SensorEntity):
         host = self._config.get("host", "Unknown")
         return {
             "identifiers": {(DOMAIN, self._config_entry.unique_id or self._config_entry.entry_id)},
-            "name": f"{self.location.provider} SmartHub Water Monthly Usage ({account_id} - {self.location.description})",
+            "name": f"{self.location.provider} SmartHub Energy Monthly Usage ({account_id} - {self.location.description})",
             "manufacturer": "SmartHub Coop",
-            "model": "Water Monitor",
+            "model": "Energy Monitor",
             "configuration_url": f"https://{host}",
         }

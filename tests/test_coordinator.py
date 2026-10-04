@@ -8,7 +8,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.smarthub import async_setup_entry
 from custom_components.smarthub.api import SmartHubAPI, SmartHubAPIError, SmartHubDataError, SmartHubLocation
-from custom_components.smarthub.const import DOMAIN, ELECTRIC_SERVICE
+from custom_components.smarthub.const import DOMAIN, ELECTRIC_SERVICE, WATER_SENSOR_KEY
 
 from custom_components.smarthub.sensor import SmartHubDataUpdateCoordinator
 from homeassistant.components.recorder import Recorder
@@ -587,6 +587,42 @@ async def test_hourly_water_failure_still_updates_electricity(
     assert Aggregation.DAILY in electric_calls
     assert result["11111"]["current_energy_usage"] == 5
     assert result["11111"]["current_water_usage"] == 2
+
+
+async def test_monthly_water_failure_still_updates_electricity(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    location = SmartHubLocation(
+        id="11111",
+        service=ELECTRIC_SERVICE,
+        description="test location",
+        provider="test provider",
+        has_water=True,
+    )
+    mock_smarthub_api.get_service_locations.return_value = [location]
+    stamp = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+    async def get_energy_data(location, aggregation, start_datetime=None, **kwargs):
+        return {"USAGE": [_usage_at(stamp, 5)]}
+
+    async def get_water_data(location, aggregation, start_datetime=None, **kwargs):
+        if aggregation == Aggregation.MONTHLY:
+            raise SmartHubDataError("monthly water rejected")
+        return {"USAGE": [_usage_at(stamp, 2)]}
+
+    mock_smarthub_api.get_energy_data.side_effect = get_energy_data
+    mock_smarthub_api.get_water_data.side_effect = get_water_data
+
+    coordinator = SmartHubDataUpdateCoordinator(
+        hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720), config_entry=mock_config_entry
+    )
+    result = await coordinator._async_update_data()
+
+    assert result["11111"]["current_energy_usage"] == 5
+    assert WATER_SENSOR_KEY not in result["11111"]
 
 
 def _assert_chunked_hourly_windows(hourly) -> None:

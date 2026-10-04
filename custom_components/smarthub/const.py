@@ -38,11 +38,7 @@ METER_NAME   = "meter_name"
 
 # List of supported services provided by the smarthub endpoint
 ELECTRIC_SERVICE = "electric"
-WATER_SERVICE = "water"
 ELECTRIC_INDUSTRY = "ELECTRIC"
 WATER_INDUSTRY = "WATER"
-SUPPORTED_SERVICES = [ELECTRIC_SERVICE, WATER_SERVICE]
+SUPPORTED_SERVICES = [ELECTRIC_SERVICE]
 FALLBACK_SERVICES = ["ELEC", "1ELEC", "VELEC", "GELEC"]
-
-# Observed ECU water source unit. Statistics are stored in cubic feet, not converted.
-WATER_UNIT_CUBIC_FEET = "FT3"
